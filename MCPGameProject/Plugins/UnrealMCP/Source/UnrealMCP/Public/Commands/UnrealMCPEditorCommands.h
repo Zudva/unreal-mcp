@@ -31,4 +31,9 @@ private:
     // Editor viewport commands
     TSharedPtr<FJsonObject> HandleFocusViewport(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleTakeScreenshot(const TSharedPtr<FJsonObject>& Params);
-}; 
+
+    // World Partition commands
+    TSharedPtr<FJsonObject> HandleWPListAllActors(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleWPLoadAll(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleDeleteActorsByPattern(const TSharedPtr<FJsonObject>& Params);
+};

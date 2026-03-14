@@ -20,6 +20,10 @@
 #include "Subsystems/EditorActorSubsystem.h"
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
+#include "WorldPartition/WorldPartition.h"
+#include "WorldPartition/WorldPartitionHelpers.h"
+#include "WorldPartition/WorldPartitionActorDesc.h"
+#include "WorldPartition/ActorDescContainerInstanceCollection.h"
 
 FUnrealMCPEditorCommands::FUnrealMCPEditorCommands()
 {
@@ -74,7 +78,20 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleCommand(const FString& C
     {
         return HandleTakeScreenshot(Params);
     }
-    
+    // World Partition commands
+    else if (CommandType == TEXT("wp_list_all"))
+    {
+        return HandleWPListAllActors(Params);
+    }
+    else if (CommandType == TEXT("wp_load_all"))
+    {
+        return HandleWPLoadAll(Params);
+    }
+    else if (CommandType == TEXT("delete_actors_by_pattern"))
+    {
+        return HandleDeleteActorsByPattern(Params);
+    }
+
     return FUnrealMCPCommonUtils::CreateErrorResponse(FString::Printf(TEXT("Unknown editor command: %s"), *CommandType));
 }
 
@@ -597,4 +614,168 @@ TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleTakeScreenshot(const TSh
     }
     
     return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to take screenshot"));
-} 
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleWPListAllActors(const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GEditor->GetEditorWorldContext().World();
+    if (!World)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to get editor world"));
+    }
+
+    // Optional name filter
+    FString NameFilter;
+    Params->TryGetStringField(TEXT("pattern"), NameFilter);
+
+    TArray<TSharedPtr<FJsonValue>> ActorArray;
+
+    // First collect loaded actors from GWorld
+    TArray<AActor*> LoadedActors;
+    UGameplayStatics::GetAllActorsOfClass(World, AActor::StaticClass(), LoadedActors);
+    TSet<FString> LoadedNames;
+    for (AActor* Actor : LoadedActors)
+    {
+        if (!Actor) continue;
+        FString Name = Actor->GetName();
+        if (!NameFilter.IsEmpty() && !Name.Contains(NameFilter)) continue;
+        LoadedNames.Add(Name);
+
+        TSharedPtr<FJsonObject> ActorObj = MakeShared<FJsonObject>();
+        ActorObj->SetStringField(TEXT("name"), Name);
+        ActorObj->SetStringField(TEXT("class"), Actor->GetClass()->GetName());
+        FVector Loc = Actor->GetActorLocation();
+        ActorObj->SetNumberField(TEXT("x"), Loc.X);
+        ActorObj->SetNumberField(TEXT("y"), Loc.Y);
+        ActorObj->SetNumberField(TEXT("z"), Loc.Z);
+        ActorObj->SetBoolField(TEXT("loaded"), true);
+        ActorArray.Add(MakeShared<FJsonValueObject>(ActorObj));
+    }
+
+    // Then enumerate World Partition descriptors for unloaded actors
+    UWorldPartition* WP = World->GetWorldPartition();
+    if (WP)
+    {
+        FWorldPartitionHelpers::ForEachActorDesc(WP, [&](const FWorldPartitionActorDesc* Desc) -> bool
+        {
+            if (!Desc) return true;
+
+            FString Name = Desc->GetActorName().ToString();
+            if (!NameFilter.IsEmpty() && !Name.Contains(NameFilter)) return true;
+            if (LoadedNames.Contains(Name)) return true; // already in loaded list
+
+            FBox Bounds = Desc->GetBounds();
+            FVector Center = Bounds.IsValid ? Bounds.GetCenter() : FVector::ZeroVector;
+
+            TSharedPtr<FJsonObject> ActorObj = MakeShared<FJsonObject>();
+            ActorObj->SetStringField(TEXT("name"), Name);
+            ActorObj->SetStringField(TEXT("class"), Desc->GetActorClass() ? Desc->GetActorClass()->GetName() : TEXT("Unknown"));
+            ActorObj->SetNumberField(TEXT("x"), Center.X);
+            ActorObj->SetNumberField(TEXT("y"), Center.Y);
+            ActorObj->SetNumberField(TEXT("z"), Center.Z);
+            ActorObj->SetBoolField(TEXT("loaded"), false);
+            ActorArray.Add(MakeShared<FJsonValueObject>(ActorObj));
+            return true;
+        });
+    }
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetArrayField(TEXT("actors"), ActorArray);
+    Result->SetNumberField(TEXT("total"), ActorArray.Num());
+    Result->SetBoolField(TEXT("has_world_partition"), WP != nullptr);
+    return Result;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleWPLoadAll(const TSharedPtr<FJsonObject>& Params)
+{
+    UWorld* World = GEditor->GetEditorWorldContext().World();
+    if (!World)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to get editor world"));
+    }
+
+    UWorldPartition* WP = World->GetWorldPartition();
+    if (!WP)
+    {
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetBoolField(TEXT("success"), true);
+        Result->SetStringField(TEXT("message"), TEXT("Level does not use World Partition — all actors already visible"));
+        return Result;
+    }
+
+    // Force-load all actors. References are kept alive by UWorldPartition internally
+    // after LoadAllActors — they persist until the editor unloads the level.
+    static TArray<FWorldPartitionReference> GLoadedRefs; // static keeps actors pinned in memory
+    GLoadedRefs.Empty();
+    WP->LoadAllActors(GLoadedRefs);
+
+    // Flush async loading so actors are in memory synchronously
+    FlushAsyncLoading();
+
+    TArray<AActor*> AllActors;
+    UGameplayStatics::GetAllActorsOfClass(World, AActor::StaticClass(), AllActors);
+    const int32 LoadedCount = AllActors.Num();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetNumberField(TEXT("loaded_actors"), LoadedCount);
+    Result->SetNumberField(TEXT("wp_references"), GLoadedRefs.Num());
+    Result->SetStringField(TEXT("message"), FString::Printf(TEXT("Loaded all WP cells — %d actors now visible"), LoadedCount));
+    return Result;
+}
+
+TSharedPtr<FJsonObject> FUnrealMCPEditorCommands::HandleDeleteActorsByPattern(const TSharedPtr<FJsonObject>& Params)
+{
+    FString Pattern;
+    if (!Params->TryGetStringField(TEXT("pattern"), Pattern))
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Missing 'pattern' parameter"));
+    }
+
+    UWorld* World = GEditor->GetEditorWorldContext().World();
+    if (!World)
+    {
+        return FUnrealMCPCommonUtils::CreateErrorResponse(TEXT("Failed to get editor world"));
+    }
+
+    TArray<AActor*> AllActors;
+    UGameplayStatics::GetAllActorsOfClass(World, AActor::StaticClass(), AllActors);
+
+    TArray<TSharedPtr<FJsonValue>> DeletedArray;
+    int32 DeletedCount = 0;
+
+    for (AActor* Actor : AllActors)
+    {
+        if (!Actor) continue;
+        if (!Actor->GetName().Contains(Pattern)) continue;
+
+        TSharedPtr<FJsonObject> ActorObj = MakeShared<FJsonObject>();
+        ActorObj->SetStringField(TEXT("name"), Actor->GetName());
+        ActorObj->SetStringField(TEXT("class"), Actor->GetClass()->GetName());
+        DeletedArray.Add(MakeShared<FJsonValueObject>(ActorObj));
+
+        Actor->Destroy();
+        ++DeletedCount;
+    }
+
+    // Also attempt to delete unloaded WP actors matching the pattern by loading their cells first
+    UWorldPartition* WP = World->GetWorldPartition();
+    if (WP && DeletedCount == 0)
+    {
+        // If nothing was deleted (actors not loaded), suggest wp_load_all first
+        TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+        Result->SetBoolField(TEXT("success"), false);
+        Result->SetNumberField(TEXT("deleted_count"), 0);
+        Result->SetStringField(TEXT("message"), TEXT("No loaded actors matched pattern. Run wp_load_all first to load World Partition cells, then retry."));
+        return Result;
+    }
+
+    // Mark level as modified so Ctrl+S saves deletions
+    World->MarkPackageDirty();
+
+    TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+    Result->SetBoolField(TEXT("success"), true);
+    Result->SetNumberField(TEXT("deleted_count"), DeletedCount);
+    Result->SetArrayField(TEXT("deleted_actors"), DeletedArray);
+    return Result;
+}
